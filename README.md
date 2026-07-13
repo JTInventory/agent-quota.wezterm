@@ -4,9 +4,9 @@
 
 [Listed on Awesome WezTerm](https://github.com/michaelbrusegard/awesome-wezterm#ai)
 
-A WezTerm plugin that shows Claude and Codex quota usage directly in the status bar.
+A WezTerm plugin that shows Claude, Codex, and Grok quota usage directly in the status bar.
 
-It displays live 5-hour and 7-day usage windows, reset countdowns, process-aware `not running` states, compact percentage bars, and a shared cache so multiple WezTerm windows do not all refresh the same data independently.
+It displays live Claude/Codex 5-hour and 7-day usage windows, Grok **subscription** monthly credit usage (from `grok` login — not an API key), reset countdowns, process-aware `not running` states, compact percentage bars, and a shared cache so multiple WezTerm windows do not all refresh the same data independently.
 
 ![Agent Quota status bar sample](assets/status-sample.svg)
 
@@ -14,9 +14,10 @@ It displays live 5-hour and 7-day usage windows, reset countdowns, process-aware
 
 - Claude 5-hour and 7-day utilization
 - Codex 5-hour and 7-day utilization
-- Reset countdowns for both providers
+- Grok subscription monthly credit utilization (OIDC login / SuperGrok-style plan)
+- Reset countdowns for each provider
 - Compact 8-cell percentage bars
-- Process-aware `not running` status for Claude and Codex
+- Process-aware `not running` status for Claude and Codex (Grok still shows subscription % when logged in)
 - Shared per-user cache in `/tmp` across WezTerm instances
 - Bundled Codex helper auto-discovery with no manual script-path setup
 - Optional Claude usage dashboard shortcut
@@ -25,7 +26,7 @@ It displays live 5-hour and 7-day usage windows, reset countdowns, process-aware
 Example output:
 
 ```text
-Claude: 5h ███░░░░░ 42% (2h31m)  ▪ 7d █░░░░░░░ 18% (4d12h)  |  Codex: 5h ███████░ 88% (2h10m)  ▪ 7d ███░░░░░ 32% (1d4h)
+Claude: 5h ███░░░░░ 42% (2h31m)  ▪ 7d █░░░░░░░ 18% (4d12h)  |  Codex: 5h ███████░ 88% (2h10m)  ▪ 7d ███░░░░░ 32% (1d4h)  |  Grok: mo █░░░░░░░ 3% (18d)
 ```
 
 ## Requirements
@@ -39,8 +40,9 @@ Tested on Linux and Windows.
 - Windows: `tasklist` (bundled) for process detection
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated for Claude usage display
 - [OpenAI Codex CLI](https://github.com/openai/codex) installed and authenticated for Codex usage display
+- [Grok CLI](https://x.ai) installed and logged in (`grok login`) for **subscription** usage display — no XAI API key required
 
-If you only use one tool, the other side simply shows `not running`.
+If you only use one tool, the other side simply shows `not running` (or Grok shows a login error until `grok login`).
 
 On Debian/Ubuntu, missing system tools can usually be installed with:
 
@@ -52,6 +54,7 @@ Expected credential files:
 
 - Claude: `~/.claude/.credentials.json`
 - Codex: `~/.codex/auth.json`
+- Grok subscription: `~/.grok/auth.json` (written by `grok login` / Grok Build OIDC — **not** an API key)
 
 ## Installation
 
@@ -61,12 +64,15 @@ Install it with WezTerm's plugin loader:
 local wezterm = require("wezterm")
 local config = wezterm.config_builder()
 
-local quota = wezterm.plugin.require("https://github.com/M-Marbouh/agent-quota.wezterm")
+-- Fork with Grok subscription support:
+local quota = wezterm.plugin.require("https://github.com/JTInventory/agent-quota.wezterm")
 
 quota.apply_to_config(config)
 
 return config
 ```
+
+If you already used the upstream plugin URL, switch it to the JTInventory fork above, then fully restart WezTerm (plugin re-pull) so Grok appears.
 
 Reload WezTerm with `CTRL+SHIFT+R`, or restart WezTerm fully.
 
@@ -85,6 +91,7 @@ quota.apply_to_config(config, {
   icons = {
     claude = "⚡",
     codex  = "✦",
+    grok   = "◈",
     week   = "▪",
   },
   bars = {
@@ -93,6 +100,7 @@ quota.apply_to_config(config, {
     full = "█",
     empty = "░",
   },
+  show_grok = true, -- set false to hide the Grok subscription section
   -- codex_script = "/absolute/path/to/codex-limits.py",
 })
 ```
@@ -105,7 +113,9 @@ Options:
 - `compact`: hide reset countdowns to shrink the status-bar footprint. Default: `false`
 - `icons.claude`: Claude prefix icon. Default: `⚡` (override to taste, e.g. `▲`)
 - `icons.codex`: Codex prefix icon. Default: `✦` (override to taste, e.g. `◆`)
+- `icons.grok`: Grok prefix icon. Default: `◈`
 - `icons.week`: separator before the 7-day window
+- `show_grok`: include the Grok subscription monthly section. Default: `true`
 - `bars.enabled`: show compact percentage bars
 - `bars.width`: number of bar cells
 - `bars.full` / `bars.empty`: glyphs used for the bar
@@ -170,6 +180,13 @@ Codex:
 - the helper starts `codex app-server --listen stdio://`
 - reads `account/rateLimits/read`
 
+Grok (subscription, not API key):
+
+- reads the OIDC session from `~/.grok/auth.json` (same login as Grok Build / `grok login`)
+- calls the subscription billing endpoint used by Grok CLI `/usage`
+- shows **monthly included credit** utilization for the current billing period
+- does **not** require an XAI console API key
+
 Shared cache:
 
 - Claude and Codex each write a per-user JSON cache file in `/tmp`
@@ -187,6 +204,7 @@ Status display:
 - Targets: Linux and Windows desktop sessions running WezTerm.
 - Claude credentials are read from `~/.claude/.credentials.json`.
 - Codex usage is read through `codex app-server --listen stdio://`, so the installed Codex CLI must support app-server rate-limit reads.
+- Grok subscription usage is read from `~/.grok/auth.json` plus the Grok CLI billing endpoint; log in with `grok login` on the same machine that runs WezTerm.
 - Required command-line tools on Linux are `python3`, `curl`, `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`; on Windows they are `python`/`python3`, `curl`, and `tasklist`.
 
 ## Known Limitations
@@ -204,7 +222,9 @@ Status display:
 - Codex helper path resolution fails in a custom environment: set `WEZTERM_AGENT_QUOTA_CODEX_HELPER=/absolute/path/to/codex-limits.py` before launching WezTerm.
 - Cached data looks stale: inspect or remove `/tmp/wezterm-quota-limit-"$USER"-*.json` and reload WezTerm.
 - Codex helper is missing: ensure the full plugin repo was installed, not just `plugin/init.lua` by itself.
+- Grok shows login/auth errors: run `grok login` on the WezTerm host so `~/.grok/auth.json` exists. This is subscription OIDC, not an API key.
+- Grok shows `idle` after the percentage: subscription usage is account-level; `idle` only means no local `grok` process was detected.
 
 ## Credit
 
-Originally based on [wezterm-quota-limit](https://github.com/EdenGibson/wezterm-quota-limit) by EdenGibson. This fork significantly extends the original Claude-only plugin with Codex support, shared cross-window caching, process-aware status states, bundled helper discovery, compact usage bars, and additional reset/error handling.
+Originally based on [wezterm-quota-limit](https://github.com/EdenGibson/wezterm-quota-limit) by EdenGibson and extended by [M-Marbouh/agent-quota.wezterm](https://github.com/M-Marbouh/agent-quota.wezterm) with Codex support. This JTInventory fork adds Grok **subscription** monthly credit usage (OIDC / `grok login`, not API-key metering).

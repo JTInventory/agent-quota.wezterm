@@ -13,6 +13,7 @@ local config = {
   icons = {
     claude = "⚡", -- override to taste, e.g. "▲"
     codex  = "✦", -- override to taste, e.g. "◆"
+    grok   = "◈", -- override to taste, e.g. "★"
     week   = "▪",
     bolt   = "⚡", -- legacy alias
   },
@@ -24,6 +25,7 @@ local config = {
   },
   codex_script = nil, -- explicit path to codex-limits.py, overrides auto-detection
   compact = false,    -- hide reset countdowns to save space
+  show_grok = true,   -- include Grok monthly credit usage
 }
 
 -- Cached usage data
@@ -46,11 +48,17 @@ local claude_running_checked_at = 0
 local codex_running_cached = nil
 local codex_running_checked_at = 0
 
+-- Grok process-state cache
+local grok_running_cached = nil
+local grok_running_checked_at = 0
+
 -- In-memory fast-path data (last returned result + timestamp)
 local claude_last_result = nil
 local claude_last_result_at = 0
 local codex_last_result = nil
 local codex_last_result_at = 0
+local grok_last_result = nil
+local grok_last_result_at = 0
 
 -- ANSI escape helpers (bypass wezterm.format to avoid nightly deserialization bugs)
 local ESC = "\x1b["
@@ -284,6 +292,8 @@ local CLAUDE_CACHE_PATH = SHARED_CACHE_PREFIX .. "-claude.json"
 local CLAUDE_LOCK_DIR = SHARED_CACHE_PREFIX .. "-claude.lock"
 local CODEX_CACHE_PATH = SHARED_CACHE_PREFIX .. "-codex.json"
 local CODEX_LOCK_DIR = SHARED_CACHE_PREFIX .. "-codex.lock"
+local GROK_CACHE_PATH = SHARED_CACHE_PREFIX .. "-grok.json"
+local GROK_LOCK_DIR = SHARED_CACHE_PREFIX .. "-grok.lock"
 local LOCK_TIMEOUT_SECS = 30
 local INVALID_STALE_RETRY_SECS = 15
 local CLAUDE_TRANSIENT_RETRY_SECS = 30
@@ -489,6 +499,9 @@ local function earliest_reset_boundary_ts(data)
   local seven_reset = data.seven_day and unix_from_iso_utc(data.seven_day.resets_at) or nil
   local primary_reset = tonumber(data.primary_reset_at)
   local secondary_reset = tonumber(data.secondary_reset_at)
+  local monthly_reset = tonumber(data.monthly_reset_at)
+    or (data.billing_period_end and unix_from_iso_utc(data.billing_period_end))
+    or nil
 
   if five_reset then
     candidates[#candidates + 1] = five_reset
@@ -501,6 +514,9 @@ local function earliest_reset_boundary_ts(data)
   end
   if secondary_reset then
     candidates[#candidates + 1] = secondary_reset
+  end
+  if monthly_reset then
+    candidates[#candidates + 1] = monthly_reset
   end
 
   if #candidates == 0 then
@@ -1164,8 +1180,300 @@ local function fetch_usage()
   return entry.data
 end
 
+-- ============================================================
+-- GROK SUBSCRIPTION (OIDC / SuperGrok — not API-key billing)
+-- ============================================================
+-- Reads the Grok CLI login session from ~/.grok/auth.json and queries
+-- the subscription monthly credit window used by `grok` /usage.
+-- This is the same OIDC subscription path as Grok Build login, not an
+-- XAI_API_KEY / console API-key meter.
+
+local grok_cached = nil
+local grok_last_fetch = 0
+local grok_errors = 0
+local grok_last_error = nil
+local grok_cached_token = nil
+
+local function sync_grok_shared_state(entry)
+  if type(entry) ~= "table" then
+    return
+  end
+  if type(entry.data) == "table" then
+    grok_cached = entry.data
+  end
+  grok_last_fetch = tonumber(entry.written_at) or grok_last_fetch
+  grok_errors = tonumber(entry.error_count) or 0
+  grok_last_error = entry.last_error
+end
+
+local function grok_auth_path()
+  local home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
+  return home .. "/.grok/auth.json"
+end
+
+local function read_grok_auth_file()
+  local path = grok_auth_path()
+  local f = io.open(path, "r")
+  if not f then
+    f = io.open(path:gsub("/", "\\"), "r")
+  end
+  if not f then
+    return nil, "no grok auth (run: grok login)"
+  end
+  local content = f:read("*a")
+  f:close()
+  return content, nil
+end
+
+-- OIDC access token from Grok CLI subscription login (~/.grok/auth.json)
+local function get_grok_subscription_token()
+  local content, err = read_grok_auth_file()
+  if not content then
+    return nil, nil, err
+  end
+
+  -- Prefer JWT-looking keys (access tokens), fall back to first "key" field
+  local token = content:match('"key"%s*:%s*"(eyJ[^"]+)"')
+  if not token then
+    token = content:match('"key"%s*:%s*"([^"]+)"')
+  end
+  if not token or token == "" then
+    return nil, nil, "no subscription token in ~/.grok/auth.json"
+  end
+
+  local expires_at = content:match('"expires_at"%s*:%s*"([^"]+)"')
+  return token, expires_at, nil
+end
+
+local function is_grok_running()
+  local now = os.time()
+  if now - grok_running_checked_at < PROCESS_CHECK_TTL then
+    return grok_running_cached
+  end
+
+  local found = false
+  if is_windows then
+    local ok, stdout = wezterm.run_child_process({
+      "tasklist", "/FI", "IMAGENAME eq grok.exe", "/NH", "/FO", "CSV",
+    })
+    found = ok and stdout ~= nil and stdout:find('"grok.exe"') ~= nil
+  else
+    local ok, stdout = wezterm.run_child_process({ "pgrep", "-x", "grok" })
+    found = ok and stdout ~= nil and stdout:match("%d") ~= nil
+    if not found then
+      -- Some installs spawn as a longer argv; fall back to process table scan
+      local ok2, psout = wezterm.run_child_process({ "ps", "-eo", "comm=" })
+      if ok2 and psout then
+        for line in psout:gmatch("[^\n]+") do
+          if line:match("^grok$") or line:match("^grok%-") then
+            found = true
+            break
+          end
+        end
+      end
+    end
+  end
+
+  grok_running_cached = found
+  grok_running_checked_at = now
+  return grok_running_cached
+end
+
+local function call_grok_subscription_billing(token)
+  local success, stdout, stderr = wezterm.run_child_process({
+    "curl",
+    "-s",
+    "-m", "8",
+    "-w", "\n%{http_code}",
+    "https://cli-chat-proxy.grok.com/v1/billing",
+    "-H", "Authorization: Bearer " .. token,
+    "-H", "Accept: application/json",
+    "-H", "User-Agent: grok-cli",
+  })
+
+  if not success or not stdout or stdout == "" then
+    return nil, nil, (stderr and stderr ~= "" and stderr) or "curl failed"
+  end
+
+  local body, http_code = stdout:match("^(.*)\n(%d+)$")
+  if not body then
+    return stdout, nil, nil
+  end
+
+  return body, tonumber(http_code), nil
+end
+
+local function parse_grok_billing(body)
+  local ok, data = pcall(wezterm.json_parse, body)
+  if not ok or type(data) ~= "table" then
+    return nil, "parse failed"
+  end
+
+  local cfg = data.config or data
+  if type(cfg) ~= "table" then
+    return nil, "no billing config"
+  end
+
+  local function money_val(field)
+    local v = cfg[field]
+    if type(v) == "table" then
+      return tonumber(v.val)
+    end
+    return tonumber(v)
+  end
+
+  local used = money_val("used")
+  local limit = money_val("monthlyLimit")
+  if not used or not limit or limit <= 0 then
+    return nil, "no monthly subscription limit"
+  end
+
+  local pct = (used / limit) * 100
+  if pct < 0 then
+    pct = 0
+  elseif pct > 100 then
+    pct = 100
+  end
+
+  local period_end = cfg.billingPeriodEnd or cfg.billing_period_end
+  local period_start = cfg.billingPeriodStart or cfg.billing_period_start
+  local reset_at = unix_from_iso_utc(period_end)
+
+  return {
+    monthly_pct = pct,
+    monthly_reset = reset_at and time_until_unix(reset_at) or nil,
+    monthly_reset_at = reset_at,
+    billing_period_end = period_end,
+    billing_period_start = period_start,
+    used = used,
+    limit = limit,
+    source = "subscription",
+  }, nil
+end
+
+local function fetch_grok_subscription()
+  local now = os.time()
+
+  if config.show_grok == false then
+    return { disabled = true }, false
+  end
+
+  if grok_last_result and (now - grok_last_result_at) < FETCH_GATE_SECS then
+    return grok_last_result, grok_running_cached
+  end
+
+  local grok_active = is_grok_running()
+
+  local shared = read_shared_cache(GROK_CACHE_PATH)
+  sync_grok_shared_state(shared)
+
+  if shared_cache_is_fresh(shared, now) then
+    grok_last_result = shared.data
+    grok_last_result_at = now
+    return shared.data, grok_active
+  end
+
+  if not acquire_lock(GROK_LOCK_DIR) then
+    shared = read_shared_cache(GROK_CACHE_PATH)
+    sync_grok_shared_state(shared)
+    if shared and shared.data then
+      grok_last_result = shared.data
+      grok_last_result_at = now
+      return shared.data, grok_active
+    end
+    local fallback = grok_cached or { error = grok_last_error or "waiting for shared refresh" }
+    grok_last_result = fallback
+    grok_last_result_at = now
+    return fallback, grok_active
+  end
+
+  local entry
+  local locked_cache = read_shared_cache(GROK_CACHE_PATH)
+  sync_grok_shared_state(locked_cache)
+
+  if shared_cache_is_fresh(locked_cache, now) then
+    release_lock(GROK_LOCK_DIR)
+    grok_last_result = locked_cache.data
+    grok_last_result_at = now
+    return locked_cache.data, grok_active
+  end
+
+  local raw_previous = (locked_cache and locked_cache.data) or grok_cached
+  local previous_data = cacheable_data(raw_previous, now)
+  local previous_errors = tonumber(locked_cache and locked_cache.error_count) or grok_errors or 0
+
+  local token, expires_at, err = get_grok_subscription_token()
+  if not token then
+    entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
+  else
+    if grok_cached_token and token ~= grok_cached_token then
+      previous_errors = 0
+      grok_last_error = nil
+    end
+    grok_cached_token = token
+
+    -- Soft expiry check (ISO timestamp). If expired, wait for grok re-login.
+    if expires_at then
+      local exp_ts = unix_from_iso_utc(expires_at)
+      if exp_ts and now >= exp_ts then
+        entry = transient_refresh_entry(
+          previous_data,
+          previous_errors,
+          "subscription token expired — run: grok login",
+          now,
+          raw_previous
+        )
+      end
+    end
+
+    if not entry then
+      local body, status, curl_err = call_grok_subscription_billing(token)
+      if curl_err then
+        entry = transient_refresh_entry(previous_data, previous_errors, curl_err, now, raw_previous)
+      elseif status == 429 then
+        local next_errors = previous_errors + 1
+        local rate_err = string.format("rate limited (retry in %dm)", math.ceil(interval_for_errors(next_errors) / 60))
+        entry = build_cache_entry(
+          previous_data or { syncing = true },
+          next_errors,
+          rate_err,
+          now,
+          CLAUDE_RATE_LIMIT_RETRY_SECS
+        )
+      elseif status == 401 or status == 403 then
+        entry = transient_refresh_entry(
+          previous_data,
+          previous_errors,
+          "subscription auth failed — run: grok login",
+          now,
+          raw_previous
+        )
+      else
+        local parsed, parse_err = parse_grok_billing(body)
+        if not parsed then
+          entry = transient_refresh_entry(previous_data, previous_errors, parse_err, now, raw_previous)
+        else
+          entry = build_cache_entry(parsed, 0, nil, now)
+        end
+      end
+    end
+  end
+
+  local wrote, write_err = write_json_file(GROK_CACHE_PATH, entry)
+  if not wrote then
+    wezterm.log_error("grok shared cache write failed: " .. tostring(write_err))
+  end
+
+  release_lock(GROK_LOCK_DIR)
+  sync_grok_shared_state(entry)
+  grok_last_result = entry.data
+  grok_last_result_at = now
+  return entry.data, grok_active
+end
+
 -- Dashboard URL
 local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
+local GROK_DASHBOARD_URL = "https://console.x.ai"
 
 -- Build status string using raw ANSI escapes (avoids wezterm.format deserialization issues)
 local function build_status_string(data, window, pane)
@@ -1263,9 +1571,60 @@ local function build_status_string(data, window, pane)
     codex_str = DIM .. coi .. BRIGHT .. "Codex: " .. DIM .. "loading..."
   end
 
+  -- ── Grok (subscription monthly credits) ─────────────────
+  local grok_str = ""
+  if config.show_grok ~= false then
+    local gd, grok_active = fetch_grok_subscription()
+    local gi = " " .. (config.icons.grok or "◈") .. " "
+
+    if type(gd) == "table" and gd.disabled then
+      grok_str = ""
+    elseif type(gd) == "table" and gd.syncing then
+      grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: " .. DIM .. "syncing..."
+    elseif type(gd) == "table" and is_rate_limited_error(gd.error) then
+      grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: " .. DIM .. "syncing..."
+    elseif type(gd) == "table" and gd.error then
+      -- Auth / login issues are more useful than a bare "not running" for subscription
+      local err = tostring(gd.error)
+      if err:find("no grok auth", 1, true) or err:find("subscription token", 1, true) or err:find("auth failed", 1, true) then
+        if not grok_active then
+          grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: " .. DIM .. "not running"
+        else
+          grok_str = DIM .. "  |" .. gi .. "Grok: " .. hex_to_fg("#f7768e") .. err
+        end
+      else
+        grok_str = DIM .. "  |" .. gi .. "Grok: " .. hex_to_fg("#f7768e") .. err
+      end
+    elseif type(gd) == "table" and gd.monthly_pct ~= nil then
+      -- Account-level subscription usage (monthly included credits)
+      local bar = usage_bar_esc(gd.monthly_pct)
+      grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: "
+        .. BRIGHT .. "mo "
+      if bar then
+        grok_str = grok_str .. bar .. DIM .. " "
+      end
+      grok_str = grok_str
+        .. usage_color_esc(gd.monthly_pct) .. string.format("%.0f%%", gd.monthly_pct)
+      if gd.monthly_reset and not config.compact then
+        grok_str = grok_str .. DIM .. " (" .. gd.monthly_reset .. ")"
+      end
+      if not grok_active then
+        -- Soft hint: data is subscription-wide, process is just local activity
+        grok_str = grok_str .. DIM .. " idle"
+      end
+    else
+      if not grok_active then
+        grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: " .. DIM .. "not running"
+      else
+        grok_str = DIM .. "  |" .. gi .. BRIGHT .. "Grok: " .. DIM .. "loading..."
+      end
+    end
+  end
+
   -- ── Join with separator ──────────────────────────────────
   return claude_str
     .. DIM .. "  |" .. codex_str
+    .. grok_str
     .. " " .. RESET
 end
 
