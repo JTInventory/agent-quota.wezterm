@@ -228,3 +228,5 @@ Status display:
 ## Credit
 
 Originally based on [wezterm-quota-limit](https://github.com/EdenGibson/wezterm-quota-limit) by EdenGibson and extended by [M-Marbouh/agent-quota.wezterm](https://github.com/M-Marbouh/agent-quota.wezterm) with Codex support. This JTInventory fork adds Grok **subscription** monthly credit usage (OIDC / `grok login`, not API-key metering).
+
+<!-- temporary native gate probe -->
